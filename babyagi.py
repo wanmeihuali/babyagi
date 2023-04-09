@@ -5,8 +5,10 @@ import time
 from collections import deque
 from typing import Dict, List
 
+import chromadb
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+
 import openai
-import pinecone
 from dotenv import load_dotenv
 
 # Load default environment variables (.env)
@@ -28,13 +30,6 @@ if "gpt-4" in OPENAI_API_MODEL.lower():
         + "\033[0m\033[0m"
     )
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
-
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "")
-assert (
-    PINECONE_ENVIRONMENT
-), "PINECONE_ENVIRONMENT environment variable is missing from .env"
 
 # Table config
 YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "")
@@ -79,22 +74,26 @@ print(f"{OBJECTIVE}")
 
 print("\033[93m\033[1m" + "\nInitial task:" + "\033[0m\033[0m" + f" {INITIAL_TASK}")
 
-# Configure OpenAI and Pinecone
+# Configure OpenAI
 openai.api_key = OPENAI_API_KEY
-pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
 
-# Create Pinecone index
-table_name = YOUR_TABLE_NAME
-dimension = 1536
-metric = "cosine"
-pod_type = "p1"
-if table_name not in pinecone.list_indexes():
-    pinecone.create_index(
-        table_name, dimension=dimension, metric=metric, pod_type=pod_type
+# Create Chroma collection
+chroma_persist_dir = "babyagi"
+chroma_client = chromadb.Client(
+    settings=chromadb.config.Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory=chroma_persist_dir,
     )
+)
 
-# Connect to the index
-index = pinecone.Index(table_name)
+table_name = YOUR_TABLE_NAME
+metric = "cosine"
+embedding_function = OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY)
+collection = chroma_client.get_or_create_collection(
+    name=table_name,
+    metadata={"hnsw:space": metric},
+    embedding_function=embedding_function,
+)
 
 # Task list
 task_list = deque([])
@@ -103,12 +102,6 @@ task_list = deque([])
 def add_task(task: Dict):
     task_list.append(task)
 
-
-def get_ada_embedding(text):
-    text = text.replace("\n", " ")
-    return openai.Embedding.create(input=[text], model="text-embedding-ada-002")[
-        "data"
-    ][0]["embedding"]
 
 
 def openai_call(
@@ -205,12 +198,15 @@ def execution_agent(objective: str, task: str) -> str:
 
 
 def context_agent(query: str, n: int):
-    query_embedding = get_ada_embedding(query)
-    results = index.query(query_embedding, top_k=n, include_metadata=True, namespace=OBJECTIVE)
+    count = collection.count()
+    if count == 0:
+        return []
+    results = collection.query(
+        query_texts=query, n_results=min(n, count), include=["metadatas"]
+    )
     # print("***** RESULTS *****")
     # print(results)
-    sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
-    return [(str(item.metadata["task"])) for item in sorted_results]
+    return [item["task"] for item in results["metadatas"][0]]
 
 
 # Add the first task
@@ -242,13 +238,22 @@ while True:
             "data": result
         }  # This is where you should enrich the result if needed
         result_id = f"result_{task['task_id']}"
-        vector = get_ada_embedding(
-            enriched_result["data"]
-        )  # get vector of the actual result extracted from the dictionary
-        index.upsert(
-            [(result_id, vector, {"task": task["task_name"], "result": result})],
-	    namespace=OBJECTIVE
-        )
+        vector = enriched_result['data']  # extract the actual result from the dictionary
+
+        if (
+            len(collection.get(ids=[result_id], include=[])["ids"]) > 0
+        ):  # Check if the result already exists
+            collection.update(
+                ids=result_id,
+                documents=vector,
+                metadatas={"task": task["task_name"], "result": result},
+            )
+        else:
+            collection.add(
+                ids=result_id,
+                documents=vector,
+                metadatas={"task": task["task_name"], "result": result},
+            )
 
         # Step 3: Create new tasks and reprioritize task list
         new_tasks = task_creation_agent(
